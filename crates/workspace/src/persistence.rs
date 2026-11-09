@@ -67,6 +67,12 @@ fn parse_timestamp(text: &str) -> DateTime<Utc> {
         .unwrap_or_else(|_| Utc::now())
 }
 
+pub(crate) fn dock_layout_was_chosen(docks: &DockStructure) -> bool {
+    [&docks.left, &docks.right, &docks.bottom]
+        .into_iter()
+        .any(|dock| dock.visible || dock.active_panel.is_some())
+}
+
 fn contains_wsl_path(paths: &PathList) -> bool {
     cfg!(windows)
         && paths
@@ -1865,6 +1871,40 @@ impl WorkspaceDb {
                 },
             )
             .collect())
+    }
+
+    /// Latest dock layout that was deliberately chosen for this remote identity.
+    /// A dock that was closed on purpose still stores its active panel. A layout
+    /// that was never chosen has neither a visible dock nor an active panel.
+    pub(crate) fn latest_chosen_docks_for_remote_connection(
+        &self,
+        options: &RemoteConnectionOptions,
+        excluding: Option<WorkspaceId>,
+    ) -> Option<DockStructure> {
+        let identity = RemoteConnectionIdentity::from(options).into_owned();
+        let connections = self.remote_connections().log_err()?;
+        let workspaces = self.recent_workspaces().log_err()?;
+        for (workspace_id, _, _, remote_connection_id, _, _) in workspaces {
+            if excluding == Some(workspace_id) {
+                continue;
+            }
+            let Some(remote_connection_id) = remote_connection_id else {
+                continue;
+            };
+            let Some(stored) = connections.get(&remote_connection_id) else {
+                continue;
+            };
+            if RemoteConnectionIdentity::from(stored).into_owned() != identity {
+                continue;
+            }
+            let Some(workspace) = self.workspace_for_id(workspace_id) else {
+                continue;
+            };
+            if dock_layout_was_chosen(&workspace.docks) {
+                return Some(workspace.docks);
+            }
+        }
+        None
     }
 
     query! {

@@ -15,15 +15,32 @@ const FILTERED_GIT_PROVIDER_HOSTNAMES: &[&str] = &[
 ];
 
 pub fn parse_ssh_config_hosts(config: &str) -> BTreeSet<String> {
+    parse_ssh_config_host_entries(config)
+        .into_iter()
+        .map(|(alias, _, _)| alias)
+        .collect()
+}
+
+/// Alias → optional `HostName` and `User` from SSH config.
+pub fn parse_ssh_config_host_entries(
+    config: &str,
+) -> Vec<(String, Option<String>, Option<String>)> {
     parse_host_blocks(config)
         .into_iter()
-        .flat_map(HostBlock::non_git_provider_hosts)
+        .flat_map(|block| {
+            let hostname = block.hostname.clone();
+            let user = block.user.clone();
+            block
+                .non_git_provider_hosts()
+                .map(move |alias| (alias, hostname.clone(), user.clone()))
+        })
         .collect()
 }
 
 struct HostBlock {
     aliases: BTreeSet<String>,
     hostname: Option<String>,
+    user: Option<String>,
 }
 
 impl HostBlock {
@@ -40,6 +57,7 @@ fn parse_host_blocks(config: &str) -> Vec<HostBlock> {
     let mut blocks = Vec::new();
     let mut aliases = BTreeSet::new();
     let mut hostname = None;
+    let mut user = None;
     let mut needs_continuation = false;
 
     for line in config.lines() {
@@ -57,19 +75,30 @@ fn parse_host_blocks(config: &str) -> Vec<HostBlock> {
 
         if keyword.eq_ignore_ascii_case("host") {
             if !aliases.is_empty() {
-                blocks.push(HostBlock { aliases, hostname });
+                blocks.push(HostBlock {
+                    aliases,
+                    hostname,
+                    user,
+                });
                 aliases = BTreeSet::new();
                 hostname = None;
+                user = None;
             }
             parse_hosts(value, &mut aliases);
             needs_continuation = line.trim_end().ends_with('\\');
         } else if keyword.eq_ignore_ascii_case("hostname") {
             hostname = value.split_whitespace().next().map(ToOwned::to_owned);
+        } else if keyword.eq_ignore_ascii_case("user") {
+            user = value.split_whitespace().next().map(ToOwned::to_owned);
         }
     }
 
     if !aliases.is_empty() {
-        blocks.push(HostBlock { aliases, hostname });
+        blocks.push(HostBlock {
+            aliases,
+            hostname,
+            user,
+        });
     }
 
     blocks
@@ -107,6 +136,7 @@ fn is_git_provider_domain(host: &str) -> bool {
 mod tests {
     use super::*;
     use indoc::indoc;
+    use std::collections::BTreeMap;
 
     #[test]
     fn test_thank_you_bjorn3() {
@@ -149,6 +179,56 @@ mod tests {
         ]);
 
         assert_eq!(expected_hosts, parse_ssh_config_hosts(hosts));
+    }
+
+    #[test]
+    fn parses_user_per_host_block() {
+        let hosts = indoc! {"
+            Host something
+              HostName whatever.tld
+
+            Host linux bsd host3
+              User bjorn
+
+            Host rpi
+              user rpi
+              hostname rpi.local
+
+            Host somehost
+              Hostname 192.168.3.3
+              User deploy
+        "};
+
+        let entries = parse_ssh_config_host_entries(hosts);
+        let by_alias: BTreeMap<_, _> = entries
+            .into_iter()
+            .map(|(alias, hostname, user)| (alias, (hostname, user)))
+            .collect();
+
+        assert_eq!(
+            by_alias.get("something"),
+            Some(&(Some("whatever.tld".to_owned()), None))
+        );
+        assert_eq!(
+            by_alias.get("linux"),
+            Some(&(None, Some("bjorn".to_owned())))
+        );
+        assert_eq!(
+            by_alias.get("bsd"),
+            Some(&(None, Some("bjorn".to_owned())))
+        );
+        assert_eq!(
+            by_alias.get("host3"),
+            Some(&(None, Some("bjorn".to_owned())))
+        );
+        assert_eq!(
+            by_alias.get("rpi"),
+            Some(&(Some("rpi.local".to_owned()), Some("rpi".to_owned())))
+        );
+        assert_eq!(
+            by_alias.get("somehost"),
+            Some(&(Some("192.168.3.3".to_owned()), Some("deploy".to_owned())))
+        );
     }
 
     #[test]

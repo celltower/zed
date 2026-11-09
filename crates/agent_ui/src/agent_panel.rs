@@ -43,7 +43,9 @@ use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
     normalize_terminal_custom_title, terminal_title_without_prefix,
 };
-use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
+use crate::thread_metadata_store::{
+    ThreadId, ThreadMetadata, ThreadMetadataStore, ThreadMetadataStoreEvent,
+};
 use crate::{
     Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
     NewNativeAgentThreadFromSummary,
@@ -99,12 +101,13 @@ use ui::{
 use util::ResultExt as _;
 use workspace::{
     CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, PathList, SerializedPathList,
-    ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId,
+    ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId, WorkspaceSettings,
     dock::{DockPosition, Panel, PanelEvent},
     item::{ItemEvent, ItemHandle},
 };
 
 const AGENT_PANEL_KEY: &str = "agent_panel";
+const REMOTE_HOST_CHAT_KEY: &str = "remote_host_chat";
 const MIN_PANEL_WIDTH: Pixels = px(300.);
 const LAST_USED_AGENT_KEY: &str = "agent_panel__last_used_external_agent";
 const LAST_CREATED_ENTRY_KIND_KEY: &str = "agent_panel__last_created_entry_kind";
@@ -357,6 +360,14 @@ struct SerializedActiveThread {
     agent_type: Agent,
     title: Option<String>,
     work_dirs: Option<SerializedPathList>,
+}
+
+struct OwnedThreadRestore {
+    agent: Agent,
+    thread_id: ThreadId,
+    work_dirs: Option<PathList>,
+    title: Option<SharedString>,
+    has_session: bool,
 }
 
 pub fn init(cx: &mut App) {
@@ -1156,11 +1167,201 @@ pub struct AgentPanel {
     is_active: bool,
 }
 
+fn hosts_ssh_picker_enabled(cx: &App) -> bool {
+    WorkspaceSettings::get_global(cx).ssh_picker == settings::SshPicker::Hosts
+}
+
+fn primary_remote_chat_key(options: &remote::RemoteConnectionOptions) -> Option<String> {
+    remote_chat_keys(options).into_iter().next()
+}
+
+fn remote_chat_keys(options: &remote::RemoteConnectionOptions) -> Vec<String> {
+    match remote::RemoteConnectionIdentity::from(options) {
+        remote::RemoteConnectionIdentity::Ssh {
+            host,
+            username,
+            port,
+        } => {
+            let port = port.unwrap_or(22);
+            let mut keys = Vec::new();
+            if let Some(username) = username.as_deref().filter(|username| !username.is_empty()) {
+                keys.push(format!("ssh\n{username}\n{host}\n{port}"));
+            }
+            keys.push(format!("ssh\n\n{host}\n{port}"));
+            keys
+        }
+        remote::RemoteConnectionIdentity::Wsl { distro_name, user } => {
+            vec![format!("wsl\n{}\n{distro_name}", user.unwrap_or_default())]
+        }
+        remote::RemoteConnectionIdentity::Docker {
+            container_id,
+            remote_user,
+        } => vec![format!("docker\n{remote_user}\n{container_id}")],
+        #[cfg(any(test, feature = "test-support"))]
+        remote::RemoteConnectionIdentity::Mock { id } => vec![format!("mock\n{id}")],
+    }
+}
+
+fn remote_connections_share_server(
+    saved: &remote::RemoteConnectionOptions,
+    current: &remote::RemoteConnectionOptions,
+) -> bool {
+    match (
+        remote::RemoteConnectionIdentity::from(saved),
+        remote::RemoteConnectionIdentity::from(current),
+    ) {
+        (
+            remote::RemoteConnectionIdentity::Ssh {
+                host: saved_host,
+                username: saved_user,
+                port: saved_port,
+            },
+            remote::RemoteConnectionIdentity::Ssh {
+                host: current_host,
+                username: current_user,
+                port: current_port,
+            },
+        ) => {
+            saved_host == current_host
+                && saved_port.unwrap_or(22) == current_port.unwrap_or(22)
+                && (saved_user.is_none()
+                    || current_user.is_none()
+                    || saved_user.as_deref() == current_user.as_deref())
+        }
+        (saved, current) => saved == current,
+    }
+}
+
+fn thread_recency(thread: &ThreadMetadata) -> DateTime<Utc> {
+    thread.interacted_at.unwrap_or(thread.updated_at)
+}
+
+fn newest_remote_thread<'a>(
+    store: &'a ThreadMetadataStore,
+    options: &remote::RemoteConnectionOptions,
+    paths: &PathList,
+) -> Option<&'a ThreadMetadata> {
+    let mut best_session: Option<&ThreadMetadata> = None;
+    let mut best_draft: Option<&ThreadMetadata> = None;
+    for thread in store.entries() {
+        if thread.archived || thread.folder_paths() != paths {
+            continue;
+        }
+        let Some(saved) = thread.remote_connection.as_ref() else {
+            continue;
+        };
+        if !remote_connections_share_server(saved, options) {
+            continue;
+        }
+        let slot = if thread.session_id.is_some() {
+            &mut best_session
+        } else {
+            &mut best_draft
+        };
+        *slot = Some(match *slot {
+            Some(current) if thread_recency(current) >= thread_recency(thread) => current,
+            _ => thread,
+        });
+    }
+    best_session.or(best_draft)
+}
+
+fn owned_restore_from_metadata(thread: &ThreadMetadata) -> OwnedThreadRestore {
+    OwnedThreadRestore {
+        agent: Agent::from(thread.agent_id.clone()),
+        thread_id: thread.thread_id,
+        work_dirs: Some(thread.folder_paths().clone()),
+        title: thread.title(),
+        has_session: thread.session_id.is_some(),
+    }
+}
+
+async fn local_remote_thread_to_restore(
+    workspace: &WeakEntity<Workspace>,
+    cx: &mut AsyncWindowContext,
+) -> Option<OwnedThreadRestore> {
+    let hosts_mode = cx
+        .update(|_, cx| hosts_ssh_picker_enabled(cx))
+        .ok()?;
+    if !hosts_mode {
+        return None;
+    }
+
+    let (options, path_list) = workspace
+        .read_with(cx, |workspace, cx| {
+            let options = workspace
+                .project()
+                .read(cx)
+                .remote_connection_options(cx)
+                .cloned();
+            let path_list = PathList::new(&workspace.root_paths(cx));
+            (options, path_list)
+        })
+        .ok()?;
+    let options = options?;
+    if path_list.is_empty() {
+        return None;
+    }
+
+    let (store, reload_task) = cx
+        .update(|_, cx| {
+            ThreadMetadataStore::try_global(cx).map(|store| {
+                let reload_task = store.read(cx).reload_task();
+                (store, reload_task)
+            })
+        })
+        .ok()
+        .flatten()?;
+    reload_task.await;
+
+    let pointed = cx
+        .update(|_, cx| {
+            let kvp = KeyValueStore::global(cx);
+            let scope = kvp.scoped(REMOTE_HOST_CHAT_KEY);
+            for key in remote_chat_keys(&options) {
+                let Some(json) = scope.read(&key).log_err().flatten() else {
+                    continue;
+                };
+                let Some(saved) = serde_json::from_str::<SerializedActiveThread>(&json).log_err()
+                else {
+                    continue;
+                };
+                let work_dirs = saved
+                    .work_dirs
+                    .as_ref()
+                    .map(PathList::deserialize)
+                    .unwrap_or_default();
+                if work_dirs != path_list {
+                    continue;
+                }
+                let metadata = store.read(cx);
+                let by_id = saved
+                    .thread_id
+                    .and_then(|thread_id| metadata.entry(thread_id))
+                    .filter(|entry| !entry.archived);
+                let by_session = saved.session_id.as_ref().and_then(|session_id| {
+                    metadata.entry_by_session(&acp_v2::SessionId::new(session_id.clone()))
+                });
+                if let Some(entry) = by_id.or(by_session).filter(|entry| !entry.archived) {
+                    return Some(owned_restore_from_metadata(entry));
+                }
+            }
+            None
+        })
+        .ok()
+        .flatten();
+    if pointed.is_some() {
+        return pointed;
+    }
+
+    store.read_with(cx, |store, _| {
+        newest_remote_thread(store, &options, &path_list).map(owned_restore_from_metadata)
+    })
+}
+
 impl AgentPanel {
     fn serialize(&mut self, cx: &mut App) {
-        let Some(workspace_id) = self.workspace_id else {
-            return;
-        };
+        let workspace_id = self.workspace_id;
 
         let selected_agent = self.selected_agent.clone();
         let last_created_entry_kind = self.last_created_entry_kind;
@@ -1222,22 +1423,49 @@ impl AgentPanel {
             .as_ref()
             .map(|draft| draft.read(cx).thread_id);
 
+        let remote_chat = self.remote_chat_record(last_active_thread.as_ref(), cx);
+        if workspace_id.is_none() && remote_chat.is_none() {
+            return;
+        }
+
         let kvp = KeyValueStore::global(cx);
         self.pending_serialization = Some(cx.background_spawn(async move {
-            save_serialized_panel(
-                workspace_id,
-                SerializedAgentPanel {
-                    selected_agent: Some(selected_agent),
-                    last_created_entry_kind,
-                    last_active_thread,
-                    last_active_terminal_id,
-                    new_draft_thread_id,
-                },
-                kvp,
-            )
-            .await?;
+            if let Some(workspace_id) = workspace_id {
+                save_serialized_panel(
+                    workspace_id,
+                    SerializedAgentPanel {
+                        selected_agent: Some(selected_agent),
+                        last_created_entry_kind,
+                        last_active_thread,
+                        last_active_terminal_id,
+                        new_draft_thread_id,
+                    },
+                    kvp.clone(),
+                )
+                .await?;
+            }
+            if let Some((key, json)) = remote_chat {
+                kvp.scoped(REMOTE_HOST_CHAT_KEY).write(key, json).await?;
+            }
             anyhow::Ok(())
         }));
+    }
+
+    /// Local pointer to the open chat for this SSH host. The transcript itself
+    /// stays in the local threads database; this only remembers which one to reopen.
+    fn remote_chat_record(
+        &self,
+        thread: Option<&SerializedActiveThread>,
+        cx: &App,
+    ) -> Option<(String, String)> {
+        if !hosts_ssh_picker_enabled(cx) {
+            return None;
+        }
+        let thread = thread?;
+        let options = self.project.read(cx).remote_connection_options(cx)?;
+        let key = primary_remote_chat_key(options)?;
+        let json = serde_json::to_string(thread).log_err()?;
+        Some((key, json))
     }
 
     pub fn load(
@@ -1369,6 +1597,15 @@ impl AgentPanel {
                 None
             };
 
+            let owned_thread_to_restore = if thread_to_restore.is_none()
+                && has_open_project
+                && terminal_to_restore.is_none()
+            {
+                local_remote_thread_to_restore(&workspace, cx).await
+            } else {
+                None
+            };
+
             let panel = workspace.update_in(cx, |workspace, window, cx| {
                 let panel = cx.new(|cx| Self::new(workspace, window, cx));
 
@@ -1401,11 +1638,20 @@ impl AgentPanel {
                     // backend; otherwise fall back to the serialized
                     // selection, then the global last-used agent.
                     // Keep a session's agent so users can resume it after reinstalling the agent.
-                    let restored_thread_agent = thread_to_restore.as_ref().and_then(|(info, _)| {
-                        let agent = clamp(info.agent_type.clone());
-                        (info.session_id.is_some() || panel.should_restore_agent(&agent, cx))
-                            .then_some(agent)
-                    });
+                    let restored_thread_agent = thread_to_restore
+                        .as_ref()
+                        .and_then(|(info, _)| {
+                            let agent = clamp(info.agent_type.clone());
+                            (info.session_id.is_some() || panel.should_restore_agent(&agent, cx))
+                                .then_some(agent)
+                        })
+                        .or_else(|| {
+                            owned_thread_to_restore.as_ref().and_then(|info| {
+                                let agent = clamp(info.agent.clone());
+                                (info.has_session || panel.should_restore_agent(&agent, cx))
+                                    .then_some(agent)
+                            })
+                        });
                     let initial_agent = restored_thread_agent.or_else(|| {
                         serialized_panel
                             .as_ref()
@@ -1437,6 +1683,18 @@ impl AgentPanel {
                             thread_id,
                             info.work_dirs.as_ref().map(PathList::deserialize),
                             info.title.clone().map(Into::into),
+                            false,
+                            AgentThreadSource::AgentPanel,
+                            window,
+                            cx,
+                        );
+                    } else if let Some(info) = owned_thread_to_restore {
+                        let agent = panel.selected_agent.clone();
+                        panel.load_agent_thread(
+                            agent,
+                            info.thread_id,
+                            info.work_dirs,
+                            info.title,
                             false,
                             AgentThreadSource::AgentPanel,
                             window,

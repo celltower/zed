@@ -117,6 +117,11 @@ pub struct WorkspaceSettingsContent {
     /// Values: empty_tab, launchpad, readme
     /// Default: launchpad
     pub on_new_window: Option<OnNewWindow>,
+    /// How the Connect via SSH / Open Remote UI lists remote targets.
+    ///
+    /// Values: projects, hosts
+    /// Default: projects
+    pub ssh_picker: Option<SshPicker>,
     /// What to do when the last window is closed
     ///
     /// Default: auto (nothing on macOS, "app quit" otherwise)
@@ -741,6 +746,30 @@ pub enum OnNewWindow {
     /// Open a root-level README in a preview tab when opening a project with no open items.
     /// Leave the pane empty if no README is found.
     Readme,
+}
+
+#[derive(
+    Copy,
+    Clone,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    Eq,
+    Debug,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SshPicker {
+    /// Nested projects picker with Open Folder / Open Project.
+    #[default]
+    Projects,
+    /// Flat SSH host list (`Name (user@host)`). Selecting a host opens the last
+    /// project for that identity, or the remote home directory.
+    Hosts,
 }
 
 #[derive(

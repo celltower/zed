@@ -53,7 +53,7 @@ use ui::{
 use update_version::UpdateVersion;
 use util::ResultExt;
 use workspace::{
-    AccessibleMode, MultiWorkspace, ToggleWorktreeSecurity, Workspace,
+    AccessibleMode, MultiWorkspace, ToggleWorktreeSecurity, Workspace, WorkspaceSettings,
     notifications::{NotifyResultExt, NotifyTaskExt as _},
 };
 
@@ -641,6 +641,45 @@ impl TitleBar {
         };
 
         let meta = SharedString::from(meta);
+        let is_ssh = matches!(options, RemoteConnectionOptions::Ssh(_));
+        let use_host_picker =
+            is_ssh && WorkspaceSettings::get_global(cx).ssh_picker == settings::SshPicker::Hosts;
+
+        let button = ButtonLike::new("remote_project")
+            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .max_w_32()
+                    .child(
+                        IconWithIndicator::new(
+                            Icon::new(icon).size(IconSize::Small).color(icon_color),
+                            Some(Indicator::dot().color(indicator_color)),
+                        )
+                        .indicator_border_color(Some(cx.theme().colors().title_bar_background))
+                        .into_any_element(),
+                    )
+                    .child(Label::new(host).size(LabelSize::Small).truncate()),
+            );
+
+        if use_host_picker {
+            let meta = meta.clone();
+            return Some(
+                button
+                    .tooltip(move |_window, cx| {
+                        Tooltip::with_meta(
+                            tooltip_title,
+                            Some(&OpenRemote::default()),
+                            meta.clone(),
+                            cx,
+                        )
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_other_ssh_server(window, cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
 
         Some(
             PopoverMenu::new("remote-project-menu")
@@ -655,37 +694,28 @@ impl TitleBar {
                         cx,
                     ))
                 })
-                .trigger_with_tooltip(
-                    ButtonLike::new("remote_project")
-                        .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .max_w_32()
-                                .child(
-                                    IconWithIndicator::new(
-                                        Icon::new(icon).size(IconSize::Small).color(icon_color),
-                                        Some(Indicator::dot().color(indicator_color)),
-                                    )
-                                    .indicator_border_color(Some(
-                                        cx.theme().colors().title_bar_background,
-                                    ))
-                                    .into_any_element(),
-                                )
-                                .child(Label::new(host).size(LabelSize::Small).truncate()),
-                        ),
-                    move |_window, cx| {
-                        Tooltip::with_meta(
-                            tooltip_title,
-                            Some(&OpenRemote::default()),
-                            meta.clone(),
-                            cx,
-                        )
-                    },
-                )
+                .trigger_with_tooltip(button, move |_window, cx| {
+                    Tooltip::with_meta(
+                        tooltip_title,
+                        Some(&OpenRemote::default()),
+                        meta.clone(),
+                        cx,
+                    )
+                })
                 .anchor(gpui::Anchor::TopLeft)
                 .into_any_element(),
         )
+    }
+
+    fn open_other_ssh_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                let handle = cx.entity().downgrade();
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    recent_projects::SshHostPicker::new(true, handle, window, cx)
+                });
+            })
+            .log_err();
     }
 
     pub fn render_restricted_mode(&self, cx: &mut Context<Self>) -> Option<AnyElement> {

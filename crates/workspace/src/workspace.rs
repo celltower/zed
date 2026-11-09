@@ -11992,6 +11992,13 @@ async fn open_remote_project_inner(
             .await;
     }
 
+    let exact_docks = serialized_workspace
+        .as_ref()
+        .map(|serialized| serialized.docks.clone());
+    let restore_host_docks = cx.update(|cx| {
+        WorkspaceSettings::get_global(cx).ssh_picker == settings::SshPicker::Hosts
+    });
+
     let items = window
         .update(cx, |_, window, cx| {
             window.activate_window();
@@ -12022,10 +12029,77 @@ async fn open_remote_project_inner(
         }
     });
 
+    if restore_host_docks {
+        apply_saved_remote_docks(
+            &project,
+            workspace_id,
+            exact_docks,
+            &workspace,
+            &window,
+            cx,
+        )
+        .await;
+    }
+
     Ok((
         workspace,
         items.into_iter().map(|item| item?.ok()).collect(),
     ))
+}
+
+fn default_remote_server_docks() -> DockStructure {
+    DockStructure {
+        left: DockData {
+            visible: true,
+            active_panel: Some("Project Panel".to_string()),
+            zoom: false,
+        },
+        right: DockData {
+            visible: true,
+            active_panel: Some("AgentPanel".to_string()),
+            zoom: false,
+        },
+        bottom: DockData::default(),
+    }
+}
+
+async fn apply_saved_remote_docks(
+    project: &Entity<Project>,
+    workspace_id: WorkspaceId,
+    exact_docks: Option<DockStructure>,
+    workspace: &Entity<Workspace>,
+    window: &WindowHandle<MultiWorkspace>,
+    cx: &mut AsyncApp,
+) {
+    if let Some(panels_task) = workspace.update(cx, |workspace, _| workspace.take_panels_task()) {
+        panels_task.await.log_err();
+    }
+
+    let docks = if let Some(docks) =
+        exact_docks.filter(|docks| persistence::dock_layout_was_chosen(docks))
+    {
+        docks
+    } else {
+        let options = cx.update(|cx| project.read(cx).remote_connection_options(cx).cloned());
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+        let fallback = cx
+            .background_spawn(async move {
+                let options = options?;
+                db.latest_chosen_docks_for_remote_connection(&options, Some(workspace_id))
+            })
+            .await;
+        fallback.unwrap_or_else(default_remote_server_docks)
+    };
+
+    let Ok(flush) = window.update(cx, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_dock_structure(docks, window, cx);
+            workspace.flush_serialization(window, cx)
+        })
+    }) else {
+        return;
+    };
+    flush.await;
 }
 
 fn deserialize_remote_project(

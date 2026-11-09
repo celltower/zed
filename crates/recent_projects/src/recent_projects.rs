@@ -4,6 +4,7 @@ mod remote_connections;
 mod remote_servers;
 pub mod sidebar_recent_projects;
 mod ssh_config;
+mod ssh_host_picker;
 
 use std::{
     path::{Path, PathBuf},
@@ -35,6 +36,7 @@ use picker::{
 use project::{Worktree, git_store::Repository};
 pub use remote_connections::RemoteSettings;
 pub use remote_servers::RemoteServerProjects;
+pub use ssh_host_picker::SshHostPicker;
 use settings::{DefaultOpenBehavior, Settings, WorktreeId};
 use workspace::{OpenPathPromptMode, ProjectGroupKey};
 
@@ -46,7 +48,7 @@ use ui::{
 use util::{ResultExt, paths::PathExt};
 use workspace::{
     HistoryManager, ModalView, MultiWorkspace, OpenMode, OpenOptions, OpenVisible, RecentWorkspace,
-    SerializedWorkspaceLocation, Workspace, WorkspaceDb, WorkspaceId,
+    SerializedWorkspaceLocation, Workspace, WorkspaceDb, WorkspaceId, WorkspaceSettings,
     notifications::DetachAndPromptErr, with_active_or_new_workspace,
 };
 use zed_actions::{OpenDevContainer, OpenRecent, OpenRemote};
@@ -496,6 +498,12 @@ pub fn init(cx: &mut App) {
                 return;
             }
             let handle = cx.entity().downgrade();
+            if WorkspaceSettings::get_global(cx).ssh_picker == settings::SshPicker::Hosts {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    SshHostPicker::new(create_new_window, handle, window, cx)
+                });
+                return;
+            }
             let fs = workspace.project().read(cx).fs().clone();
             workspace.toggle_modal(window, cx, |window, cx| {
                 RemoteServerProjects::new(create_new_window, fs, window, handle, cx)
